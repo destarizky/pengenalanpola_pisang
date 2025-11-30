@@ -1,0 +1,23 @@
+# === IGNORE DATASET ===
+train/
+test/
+
+# === IGNORE MODEL BESAR ===
+best_model.keras
+fish_classifier_model.h5
+fish_classifier_model.keras
+
+# ignore semua file model keras/h5
+*.keras
+*.h5
+
+# === IGNORE JUPYTER CHECKPOINTS ===
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# === IGNORE PYTHON CACHE ===
+__pycache__/
+*.pyc
+
+# === IGNORE LAINNYA YANG TIDAK PERLU DI GIT ===
+.DS_Store
