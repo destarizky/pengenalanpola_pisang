@@ -349,7 +349,15 @@ def load_model():
         st.error(f"Model file tidak ditemukan: {MODEL_PATH}")
         st.info("Jalankan notebook terlebih dahulu untuk melatih dan menyimpan model!")
         return None
-    return tf.keras.models.load_model(MODEL_PATH)
+    model = tf.keras.models.load_model(MODEL_PATH)
+    
+    # Cek apakah model memiliki layer 'last_conv'
+    layer_names = [layer.name for layer in model.layers]
+    if 'last_conv' not in layer_names:
+        st.warning("⚠️ Model tidak memiliki layer 'last_conv'. Visualisasi Grad-CAM mungkin tidak tersedia.")
+        st.info(f"Available layers: {', '.join(layer_names)}")
+    
+    return model
 
 @st.cache_data
 def load_class_indices():
@@ -376,7 +384,7 @@ def preprocess_image(image):
     return img_array
 
 def predict_fish(image, model, class_indices):
-    """Melakukan prediksi klasifikasi ikan"""
+    """Melakukan prediksi klasifikasi pisang"""
     # Preprocess
     img_array = preprocess_image(image)
     
@@ -396,6 +404,62 @@ def predict_fish(image, model, class_indices):
         all_probs[class_name] = float(prob)
     
     return pred_class_name, confidence, all_probs
+
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name='last_conv', pred_index=None):
+    """Generate Grad-CAM heatmap untuk visualisasi model"""
+    # Create a model that maps input to the activations of the last conv layer and output predictions
+    last_conv_layer = model.get_layer(last_conv_layer_name)
+    # Use model.layers[-1].output instead of model.output to avoid list issue
+    output_layer = model.layers[-1].output
+    
+    grad_model = tf.keras.models.Model(
+        inputs=model.inputs,
+        outputs=[last_conv_layer.output, output_layer]
+    )
+    
+    # Compute gradient of top predicted class with respect to the activations of the last conv layer
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+    
+    # Gradient of the predicted class with regard to the output feature map of the last conv layer
+    grads = tape.gradient(class_channel, conv_outputs)
+    
+    # Vector of mean intensity of the gradient over a specific feature map channel
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    # Multiply each channel by importance of the channel
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    
+    # Normalize the heatmap
+    heatmap = tf.maximum(heatmap, 0)
+    max_val = tf.math.reduce_max(heatmap)
+    if max_val == 0:
+        return np.zeros(heatmap.shape)
+    heatmap = heatmap / max_val
+    return heatmap.numpy()
+
+def create_gradcam_overlay(image, heatmap, alpha=0.4):
+    """Create overlay of heatmap on original image"""
+    # Convert PIL image to numpy array
+    img_array = np.array(image.resize(IMG_SIZE))
+    
+    # Resize heatmap to match image size
+    heatmap_resized = cv2.resize(heatmap, (img_array.shape[1], img_array.shape[0]))
+    
+    # Convert heatmap to RGB
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+    heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+    
+    # Superimpose the heatmap on original image
+    superimposed = cv2.addWeighted(img_array, 1 - alpha, heatmap_colored, alpha, 0)
+    
+    return heatmap_colored, superimposed
 
 # ====================================
 # NAVBAR COMPONENT
@@ -922,7 +986,7 @@ def show_about():
 def show_classify():
     """Halaman Klasifikasi"""
     st.title("🔍 Klasifikasi Jenis Pisang")
-    st.markdown("Upload gambar pisang untuk mengetahui jenisnya")
+    st.markdown("Upload gambar pisang untuk mengetahui jenisnya dengan visualisasi AI")
     st.markdown("---")
     
     # Load model
@@ -957,10 +1021,11 @@ def show_classify():
         with st.expander("💡 Tips untuk Hasil Terbaik"):
             st.markdown("""
             - Gunakan gambar dengan pencahayaan yang baik
-            - Pastikan pisang terlihat jelas
+            - Pastikan pisang terlihat jelas dan fokus
             - Hindari gambar yang blur atau buram
             - Ukuran gambar minimal 150x150 pixels
             - Background yang kontras lebih baik
+            - Posisi pisang yang jelas (tampak samping lebih baik)
             """)
         
         if uploaded_file is not None:
@@ -1055,7 +1120,61 @@ def show_classify():
                         st.markdown("---")
                         st.markdown(f"⏱️ **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                         
+                        # Grad-CAM Visualization
+                        st.markdown("---")
+                        st.markdown("### 🔥 Visualisasi Grad-CAM")
+                        st.info("💡 **Grad-CAM** menunjukkan bagian mana dari gambar yang paling berpengaruh dalam keputusan model.")
+                        
+                        with st.spinner("🎨 Membuat visualisasi Grad-CAM..."):
+                            try:
+                                # Generate Grad-CAM
+                                img_array = preprocess_image(image)
+                                pred_idx = list(class_indices.values())[list(class_indices.keys()).index(pred_class)]
+                                
+                                # Debug info (optional - bisa di-comment jika sudah berhasil)
+                                st.write(f"🔍 Debug: Predicted class index = {pred_idx}")
+                                st.write(f"🔍 Debug: Image array shape = {img_array.shape}")
+                                
+                                # Make heatmap
+                                heatmap = make_gradcam_heatmap(img_array, model, 'last_conv', pred_idx)
+                                
+                                # Create overlay
+                                heatmap_colored, superimposed = create_gradcam_overlay(image, heatmap)
+                                
+                                # Display visualizations in columns
+                                viz_col1, viz_col2, viz_col3 = st.columns(3)
+                                
+                                with viz_col1:
+                                    st.markdown("**📷 Gambar Asli**")
+                                    st.image(image.resize(IMG_SIZE), use_column_width=True)
+                                
+                                with viz_col2:
+                                    st.markdown("**🔥 Heatmap**")
+                                    st.image(heatmap_colored, use_column_width=True, clamp=True)
+                                
+                                with viz_col3:
+                                    st.markdown("**✨ Overlay**")
+                                    st.image(superimposed, use_column_width=True, clamp=True)
+                                
+                                st.markdown("""
+                                <div style='padding: 1rem; background: #f0f8ff; border-radius: 10px; margin-top: 1rem;'>
+                                    <p style='margin: 0; color: #555;'>
+                                    <strong>🔍 Interpretasi:</strong> Area berwarna <span style='color: red; font-weight: bold;'>merah/kuning</span> 
+                                    menunjukkan bagian yang <strong>paling penting</strong> untuk klasifikasi. 
+                                    Area <span style='color: blue; font-weight: bold;'>biru/ungu</span> kurang berpengaruh.
+                                    </p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                st.success("✅ Visualisasi Grad-CAM berhasil dibuat!")
+                                
+                            except Exception as e:
+                                st.error(f"❌ Error membuat visualisasi Grad-CAM:")
+                                st.exception(e)
+                                st.info("💡 Pastikan model memiliki layer 'last_conv'. Cek arsitektur model di notebook.")
+                        
                         # Download result button
+                        st.markdown("---")
                         result_text = f"""
                         HASIL KLASIFIKASI PISANG
                         ========================
@@ -1086,7 +1205,25 @@ def show_classify():
                 cols = st.columns(2)
                 for idx, cls_name in enumerate(sorted(class_indices.keys())):
                     with cols[idx % 2]:
-                        st.markdown(f"✓ **{cls_name}**")
+                        st.markdown(f"🍌 **{cls_name}**")
+            
+            # Add information about Grad-CAM
+            st.markdown("---")
+            st.markdown("### 🔥 Fitur Visualisasi")
+            st.markdown("""
+            <div class='feature-card'>
+                <h4 style='color: #667eea; margin-bottom: 1rem;'>📊 Grad-CAM (Gradient-weighted Class Activation Mapping)</h4>
+                <p style='color: #555; line-height: 1.6;'>
+                Setelah melakukan klasifikasi, sistem akan menampilkan visualisasi <strong>Grad-CAM</strong> yang menunjukkan:
+                </p>
+                <ul style='color: #555; line-height: 1.8;'>
+                    <li>🎯 <strong>Area penting</strong> yang digunakan model untuk membuat keputusan</li>
+                    <li>🔥 <strong>Heatmap</strong> dengan gradasi warna merah-kuning-biru</li>
+                    <li>✨ <strong>Overlay</strong> heatmap pada gambar asli untuk interpretasi mudah</li>
+                    <li>🧠 Membantu memahami <strong>"pemikiran" model AI</strong></li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
 
 def show_contact():
     """Halaman Kontak"""
